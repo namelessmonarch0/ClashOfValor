@@ -2,6 +2,8 @@
 # Edit at https://www.toptal.com/developers/gitignore?templates=visualstudiocode,c++,macos,windows,linux,visualstudio
 
 game
+saves.db
+build/
 
 ### C++ ###
 # Prerequisites
