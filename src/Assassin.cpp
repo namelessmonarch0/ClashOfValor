@@ -4,8 +4,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "Input.h"
+#include "Menu.h"
 
 using namespace std;
 
@@ -58,14 +60,15 @@ void Assassin::critAttack(Character &opponent)
 TurnResult Assassin::battleMenu(Character &opponent)
 {
     cout << "Choose your next move" << endl;
-    cout << "1. Attack" << endl;
-    cout << "2. Crit Attack" << endl;
-    cout << "3. Drink health potion" << endl;
-    cout << "4. Rest" << endl;
-    cout << "5. Flee" << endl;
+    vector<string> items;
+    items.push_back("Attack");
+    items.push_back("Crit Attack");
+    items.push_back("Drink health potion");
+    items.push_back("Rest");
+    items.push_back("Flee");
 
-    int selection = 0;
-    if (!input::readInt("> ", 1, 5, selection))
+    const int selection = menu::choose(items);
+    if (selection < 0)
     {
         return TurnResult::Fled;
     }

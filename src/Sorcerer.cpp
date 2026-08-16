@@ -4,8 +4,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "Input.h"
+#include "Menu.h"
 
 using namespace std;
 
@@ -118,14 +120,15 @@ void Sorcerer::rest()
 TurnResult Sorcerer::battleMenu(Character &opponent)
 {
     cout << "Choose your next move" << endl;
-    cout << "1. Cast fire orb" << endl;
-    cout << "2. Drink health potion" << endl;
-    cout << "3. Drink mana potion" << endl;
-    cout << "4. Rest" << endl;
-    cout << "5. Flee" << endl;
+    vector<string> items;
+    items.push_back("Cast fire orb");
+    items.push_back("Drink health potion");
+    items.push_back("Drink mana potion");
+    items.push_back("Rest");
+    items.push_back("Flee");
 
-    int selection = 0;
-    if (!input::readInt("> ", 1, 5, selection))
+    const int selection = menu::choose(items);
+    if (selection < 0)
     {
         return TurnResult::Fled;
     }

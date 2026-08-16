@@ -1,6 +1,5 @@
 #include <cstdlib>
 #include <ctime>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -10,9 +9,14 @@
 #include "Assassin.h"
 #include "Character.h"
 #include "Input.h"
+#include "Intro.h"
+#include "Layout.h"
+#include "Menu.h"
 #include "Paths.h"
+#include "RawTerminal.h"
 #include "SaveStore.h"
 #include "Sorcerer.h"
+#include "Terminal.h"
 #include "Warrior.h"
 
 using namespace std;
@@ -30,20 +34,6 @@ enum class BattleOutcome
     SecondWon,
     Fled
 };
-
-void printASCII(const string &filename)
-{
-    ifstream inFile(filename.c_str());
-    if (!inFile.is_open())
-    {
-        return;
-    }
-    string line;
-    while (getline(inFile, line))
-    {
-        cout << line << endl;
-    }
-}
 
 void showStatus(const Character &a, const Character &b)
 {
@@ -109,20 +99,27 @@ CharacterPtr createRandomOpponent()
 
 CharacterPtr newCharacter()
 {
+    // Ordinary line editing (visible echo, backspace, Enter to finish) for
+    // the one prompt that asks for free text rather than a menu choice.
+    // No-ops harmlessly when raw mode was never active.
+    rawterm::suspend();
     string playerName;
-    if (!input::readLine("Enter your character name: ", playerName))
+    const bool gotName = input::readLine("Enter your character name: ", playerName);
+    rawterm::resume();
+    if (!gotName)
     {
         return CharacterPtr();
     }
 
     cout << "Select your class:" << endl;
     cout << "------------------" << endl;
-    cout << "1. Warrior  (carries a shield that absorbs damage before health)" << endl;
-    cout << "2. Assassin (trades survivability for a high-damage critical strike)" << endl;
-    cout << "3. Sorcerer (spends mana on fire orbs that hit harder than steel)" << endl;
+    vector<string> classItems;
+    classItems.push_back("Warrior  (carries a shield that absorbs damage before health)");
+    classItems.push_back("Assassin (trades survivability for a high-damage critical strike)");
+    classItems.push_back("Sorcerer (spends mana on fire orbs that hit harder than steel)");
 
-    int classSelection = 0;
-    if (!input::readInt("> ", 1, 3, classSelection))
+    const int classSelection = menu::choose(classItems);
+    if (classSelection < 0)
     {
         return CharacterPtr();
     }
@@ -156,13 +153,14 @@ CharacterPtr loadCharacter(SaveStore &store)
     }
 
     cout << "Saved characters:" << endl;
+    vector<string> items;
     for (size_t i = 0; i < saved.size(); ++i)
     {
-        cout << "  " << (i + 1) << ". " << saved[i].first << " (" << saved[i].second << ")" << endl;
+        items.push_back(saved[i].first + " (" + saved[i].second + ")");
     }
 
-    int choice = 0;
-    if (!input::readInt("Which character? ", 1, static_cast<int>(saved.size()), choice))
+    const int choice = menu::choose(items);
+    if (choice < 0)
     {
         return CharacterPtr();
     }
@@ -179,8 +177,11 @@ CharacterPtr loadCharacter(SaveStore &store)
 
 void offerSave(SaveStore &store, Character &character)
 {
-    int choice = 0;
-    if (!input::readInt("Save this character? (1 = yes, 2 = no) ", 1, 2, choice) || choice != 1)
+    cout << "Save this character?" << endl;
+    vector<string> items;
+    items.push_back("Yes, save");
+    items.push_back("No, discard");
+    if (menu::choose(items) != 1)
     {
         return;
     }
@@ -198,10 +199,13 @@ void playerVsBot(SaveStore &store)
 {
     while (true)
     {
-        cout << endl << "1. New Character" << endl << "2. Load Character" << endl << "3. Back" << endl;
-
-        int choice = 0;
-        if (!input::readInt("> ", 1, 3, choice) || choice == 3)
+        cout << endl;
+        vector<string> items;
+        items.push_back("New Character");
+        items.push_back("Load Character");
+        items.push_back("Back");
+        const int choice = menu::choose(items);
+        if (choice < 0 || choice == 3)
         {
             return;
         }
@@ -269,7 +273,40 @@ int main(int argc, char **argv)
 
     srand(static_cast<unsigned>(time(0)));  // seeded once, not on every menu pass
 
-    printASCII(paths::asset("art.txt"));
+    // Full-screen mode is opt-in by circumstance, not configuration: it only
+    // activates when both stdin and stdout are real terminals. Piped input,
+    // `make test`, and CI all fall through untouched, which is what keeps the
+    // existing regression suite passing without knowing any of this exists.
+    unique_ptr<rawterm::RawTerminal> rawSession;
+    if (terminal::isInteractive())
+    {
+        terminal::watchForResize();
+        rawSession.reset(new rawterm::RawTerminal());
+        if (!rawSession->isActive())
+        {
+            // tcgetattr/tcsetattr failed despite isatty() succeeding -- rare,
+            // but fall back to the plain sequential experience rather than
+            // half-apply a broken raw mode.
+            rawSession.reset();
+        }
+    }
+
+    // Raw mode has to be up *before* the splash, not after: skipping it is
+    // detected by polling for a single keystroke, which only works once
+    // stdin is in cbreak mode. intro::playSplash() checks rawterm::isActive()
+    // itself and falls back to a single plain print when it isn't (piped
+    // input, or the rare raw-mode failure above).
+    if (rawSession)
+    {
+        cout << "\x1b[2J\x1b[H";  // fresh canvas for the splash
+    }
+    intro::playSplash();
+    if (rawSession)
+    {
+        cout << "\x1b[2J\x1b[H";  // the splash disappears before the header appears
+        const terminal::Size size = terminal::getSize();
+        layout::drawHeader(size.cols, size.rows);
+    }
 
     SaveStore store;
     if (!store.open(paths::data("saves.db")))
@@ -279,10 +316,26 @@ int main(int argc, char **argv)
 
     while (true)
     {
-        cout << endl << "1. Player vs Bot" << endl << "2. Player vs Player" << endl << "3. Exit" << endl;
+        // Reflow is lazy by design: it applies at the next natural redraw
+        // point (here, returning to the top-level menu) rather than
+        // interrupting whatever prompt is currently blocked on input. Doing
+        // better would mean giving every blocking `cin >>` in Input.cpp an
+        // EINTR-aware retry loop, which starts to matter once Menu::choose()
+        // (Phase C) reads single keystrokes directly and can poll for a
+        // resize between them -- not before.
+        if (rawSession && terminal::resizePending())
+        {
+            const terminal::Size size = terminal::getSize();
+            layout::drawHeader(size.cols, size.rows);
+        }
 
-        int menuSelection = 0;
-        if (!input::readInt("> ", 1, 3, menuSelection) || menuSelection == 3)
+        cout << endl;
+        vector<string> topItems;
+        topItems.push_back("Player vs Bot");
+        topItems.push_back("Player vs Player");
+        topItems.push_back("Exit");
+        const int menuSelection = menu::choose(topItems);
+        if (menuSelection < 0 || menuSelection == 3)
         {
             cout << "Exiting..." << endl;
             break;
