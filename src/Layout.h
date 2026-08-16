@@ -2,6 +2,7 @@
 #define LAYOUT_H
 
 #include <string>
+#include <vector>
 
 // Width/height-aware art rendering for the two banners the game uses: the
 // full-screen splash ("CLASH OF VALOR") and the pinned header ("hello,
@@ -20,11 +21,19 @@ namespace layout
 // line of literal text and always fits anywhere the game is likely to run.
 void printSplash(int termWidth, int termHeight);
 
-// Resolves to the same tier printSplash() would choose, but returns the
-// asset's filesystem path instead of printing it -- for a caller (Intro) that
-// needs to hand the raw file to an external renderer (ttfx) rather than print
-// it itself. Empty string if no tier's asset could be read at all.
-std::string pickSplashAssetPath(int termWidth, int termHeight);
+// A splash tier fully composed for a given terminal size: horizontally
+// centered (leading spaces baked into each art line) and vertically centered
+// within whatever space remains below `reservedTopRows` (leading blank
+// lines). `artStartIndex` marks where the real content begins, so a caller
+// animating line-by-line (Intro's native reveal) can print the blank padding
+// instantly and only animate the art itself. Empty `lines` if no tier's
+// asset could be read at all.
+struct SplashBlock
+{
+    std::vector<std::string> lines;
+    int artStartIndex;
+};
+SplashBlock composeSplash(int termWidth, int termHeight, int reservedTopRows);
 
 // Draws the best-fitting header tier at the top of the screen, centered, and
 // pins it with a VT100 scrolling region (DECSTBM) so everything printed

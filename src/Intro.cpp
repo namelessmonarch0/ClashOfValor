@@ -5,15 +5,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "ExternalTool.h"
 #include "Layout.h"
-#include "Paths.h"
 #include "RawTerminal.h"
 #include "Terminal.h"
 
@@ -22,70 +22,70 @@ using namespace std;
 namespace
 {
 
-// Manual PATH search plus the one fallback location that actually matters
-// here: `cargo install`'s default install root, ~/.cargo/bin, which is not
-// guaranteed to be on PATH even immediately after installing -- confirmed
-// empirically on the machine this was built on, where `which ttfx` failed
-// right after `cargo install --git ... ttfx` succeeded.
-string findExecutable(const string &name)
+// Runs `<ttfxPath> burn` with `content` piped into its stdin -- the same
+// mechanism ttfx's own README documents (`cat file | ttfx burn`), used here
+// instead of --input-file specifically so the content can already be
+// centered for the current terminal before ttfx ever sees it: ttfx has no
+// centering of its own, it just renders whatever text it's handed starting
+// from the cursor's current position.
+//
+// The real terminal is inherited on stdout/stderr, and the child's natural
+// exit races a keypress so the effect is always skippable -- ttfx has no
+// built-in skip of its own (confirmed by inspecting its output byte-for-byte
+// in an earlier session: it never reads stdin at all when given
+// --input-file, and here it only reads the piped content, not further
+// keystrokes). Returns true if the effect actually played, whether it
+// finished on its own or was skipped; false if it could not even be
+// started, so the caller knows to fall back to the native reveal instead.
+bool runTtfxBurn(const string &ttfxPath, const string &content)
 {
-    if (const char *pathEnv = getenv("PATH"))
+    int pipefd[2];
+    if (pipe(pipefd) != 0)
     {
-        const string path(pathEnv);
-        size_t start = 0;
-        while (start <= path.size())
-        {
-            const size_t colon = path.find(':', start);
-            const string dir = (colon == string::npos) ? path.substr(start) : path.substr(start, colon - start);
-            if (!dir.empty())
-            {
-                const string candidate = dir + "/" + name;
-                if (access(candidate.c_str(), X_OK) == 0)
-                {
-                    return candidate;
-                }
-            }
-            if (colon == string::npos)
-            {
-                break;
-            }
-            start = colon + 1;
-        }
+        return false;
     }
 
-    if (const char *home = getenv("HOME"))
-    {
-        const string candidate = string(home) + "/.cargo/bin/" + name;
-        if (access(candidate.c_str(), X_OK) == 0)
-        {
-            return candidate;
-        }
-    }
-
-    return "";
-}
-
-// Runs `<ttfxPath> --input-file <assetPath> burn` with the real terminal
-// inherited on stdout/stderr, racing the child's natural exit against a
-// keypress so the effect is always skippable -- ttfx has no built-in skip of
-// its own (confirmed by inspecting its output byte-for-byte: it never reads
-// stdin when given --input-file, so nothing on our end tells it to stop
-// early). Returns true if the effect actually played, whether it finished on
-// its own or was skipped; false if it could not even be started, so the
-// caller knows to fall back to the native reveal instead.
-bool runTtfxBurn(const string &ttfxPath, const string &assetPath)
-{
     const pid_t pid = fork();
     if (pid < 0)
     {
+        close(pipefd[0]);
+        close(pipefd[1]);
         return false;
     }
 
     if (pid == 0)
     {
-        execl(ttfxPath.c_str(), ttfxPath.c_str(), "--input-file", assetPath.c_str(), "burn", static_cast<char *>(0));
+        close(pipefd[1]);
+        dup2(pipefd[0], STDIN_FILENO);
+        close(pipefd[0]);
+        execl(ttfxPath.c_str(), ttfxPath.c_str(), "burn", static_cast<char *>(0));
         _exit(127);  // execl only returns on failure; 127 is our own sentinel for that
     }
+
+    close(pipefd[0]);  // parent only writes
+    {
+        // The composed splash is a few KB at most -- comfortably under what
+        // a pipe write completes without blocking even before a reader
+        // starts, so no partial-write/select loop is needed here, just an
+        // EINTR-retrying write().
+        const char *data = content.data();
+        size_t remaining = content.size();
+        while (remaining > 0)
+        {
+            const ssize_t n = write(pipefd[1], data, remaining);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                break;  // pipe error (e.g. child already exited); stop writing
+            }
+            data += static_cast<size_t>(n);
+            remaining -= static_cast<size_t>(n);
+        }
+    }
+    close(pipefd[1]);  // EOF -- ttfx stops reading and proceeds to render
 
     // A Ctrl-C here has to be able to kill this specific child too -- without
     // this, SIGINT would restore the terminal and end our process while ttfx
@@ -139,54 +139,30 @@ bool runTtfxBurn(const string &ttfxPath, const string &assetPath)
 // line by line under a warm gradient. A skip keypress fast-forwards the
 // remaining lines to print instantly rather than cutting the banner off
 // mid-reveal, so the transition into the header never leaves something
-// visibly half-drawn.
-//
-// Plain byte-length centering is accurate here because the splash assets are
-// figlet-generated ASCII, not the UTF-8 block glyphs Layout's own width
-// measurement guards against more generally for future assets.
+// visibly half-drawn. Blank vertical-centering padding lines carry no visual
+// interest and print instantly, never part of the timed reveal.
 void nativeReveal(int termWidth, int termHeight)
 {
-    const string path = layout::pickSplashAssetPath(termWidth, termHeight);
-    if (path.empty())
+    const layout::SplashBlock block = layout::composeSplash(termWidth, termHeight, 2);
+    if (block.lines.empty())
     {
         return;
     }
 
-    vector<string> lines;
-    int width = 0;
+    for (int i = 0; i < block.artStartIndex; ++i)
     {
-        ifstream in(path.c_str());
-        if (!in.is_open())
-        {
-            return;
-        }
-        string line;
-        while (getline(in, line))
-        {
-            if (!line.empty() && line[line.size() - 1] == '\r')
-            {
-                line.erase(line.size() - 1);
-            }
-            width = max(width, static_cast<int>(line.size()));
-            lines.push_back(line);
-        }
+        cout << "\r\n";
     }
-    if (lines.empty())
-    {
-        return;
-    }
-
-    const int pad = max(0, (termWidth - width) / 2);
-    const string padding(pad, ' ');
 
     static const int colors[] = {220, 214, 208, 202, 196};  // gold -> orange -> red
     const size_t colorCount = sizeof(colors) / sizeof(colors[0]);
 
     bool skipped = false;
-    for (size_t i = 0; i < lines.size(); ++i)
+    for (size_t i = static_cast<size_t>(block.artStartIndex); i < block.lines.size(); ++i)
     {
-        const int color = colors[min(i, colorCount - 1)];
-        cout << padding << "\x1b[38;5;" << color << "m" << lines[i] << "\x1b[0m\r\n";
+        const size_t frameIndex = i - static_cast<size_t>(block.artStartIndex);
+        const int color = colors[min(frameIndex, colorCount - 1)];
+        cout << "\x1b[38;5;" << color << "m" << block.lines[i] << "\x1b[0m\r\n";
         cout.flush();
 
         if (skipped)
@@ -219,18 +195,28 @@ void playSplash()
     }
 
     const terminal::Size size = terminal::getSize();
-    const string assetPath = layout::pickSplashAssetPath(size.cols, size.rows);
 
-    cout << "(press any key to skip)\r\n\r\n";
-    cout.flush();
+    {
+        const string hint = "(press any key to skip)";
+        const int pad = max(0, (size.cols - static_cast<int>(hint.size())) / 2);
+        cout << string(static_cast<size_t>(pad), ' ') << hint << "\r\n\r\n";
+        cout.flush();
+    }
 
     bool played = false;
-    if (!assetPath.empty())
+    const layout::SplashBlock block = layout::composeSplash(size.cols, size.rows, 2);
+    if (!block.lines.empty())
     {
-        const string ttfxPath = findExecutable("ttfx");
+        const string ttfxPath = externaltool::findExecutable("ttfx");
         if (!ttfxPath.empty())
         {
-            played = runTtfxBurn(ttfxPath, assetPath);
+            string content;
+            for (size_t i = 0; i < block.lines.size(); ++i)
+            {
+                content += block.lines[i];
+                content += '\n';
+            }
+            played = runTtfxBurn(ttfxPath, content);
         }
     }
 

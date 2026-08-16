@@ -4,6 +4,7 @@
 #include <iostream>
 #include <string>
 
+#include "Animate.h"
 #include "SaveStore.h"
 
 using namespace std;
@@ -143,8 +144,10 @@ void Character::drinkHealthPotion()
 
     const int before = health;
     setHealth(health + rules::POTION_HEALTH);
-    cout << getName() << " drinks a healing potion, mending their wounds. +" << (health - before) << " health ("
-         << healthPotion << " left)." << endl;
+    const int gained = health - before;
+    cout << getName() << " drinks a healing potion, mending their wounds. +" << gained << " health (" << healthPotion
+         << " left)." << endl;
+    animate::potionFlourish(gained, "HP", 82);  // bright green
 }
 
 void Character::levelUp()

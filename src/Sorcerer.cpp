@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "Animate.h"
 #include "Input.h"
 #include "Menu.h"
 
@@ -102,8 +103,10 @@ void Sorcerer::drinkManaPotion()
 
     const int before = mana;
     setMana(mana + rules::POTION_MANA);
-    cout << getName() << " drains a shimmering mana potion, arcane energy coursing through them. +" << (mana - before)
+    const int gained = mana - before;
+    cout << getName() << " drains a shimmering mana potion, arcane energy coursing through them. +" << gained
          << " mana (" << manaPotion << " left)." << endl;
+    animate::potionFlourish(gained, "MP", 45);  // bright blue/cyan
 }
 
 void Sorcerer::rest()

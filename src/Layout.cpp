@@ -3,11 +3,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "ExternalTool.h"
 #include "Paths.h"
 
 using namespace std;
@@ -114,6 +116,101 @@ vector<string> splashTierNames()
     return tiers;
 }
 
+// Renders assets/header.png through chafa, sized to the current terminal,
+// for the pinned header. Unlike the splash's fixed tiers, this scales
+// continuously -- a different terminal width gets a differently-sized
+// render, not a jump between discrete breakpoints. Returns false (leaving
+// `out` untouched) if chafa isn't installed, the render fails, or the
+// result doesn't fit -- the caller falls back to the plain-text tiers in
+// that case, the same way the splash falls back to nativeReveal() when ttfx
+// isn't available.
+bool tryChafaHeader(int termWidth, int termHeight, int minScrollRows, Art &out)
+{
+    const string chafaPath = externaltool::findExecutable("chafa");
+    if (chafaPath.empty())
+    {
+        return false;
+    }
+
+    // A conservative target width: a cap so the header never dominates a
+    // very wide terminal, and a floor below which chafa's own resolution
+    // stops reading as text (verified empirically during planning -- ~50
+    // columns was the practical lower bound for "hello traveler" staying
+    // legible).
+    const int targetWidth = min(termWidth - 4, 70);
+    if (targetWidth < 30)
+    {
+        return false;
+    }
+
+    const string pngPath = paths::asset("header.png");
+    const string cmd = "\"" + chafaPath + "\" -f symbols \"" + pngPath + "\" --size " + to_string(targetWidth) +
+                       "x --symbols block -c none 2>/dev/null";
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe)
+    {
+        return false;
+    }
+
+    string output;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0)
+    {
+        output.append(buf, n);
+    }
+    const int rc = pclose(pipe);
+    if (rc != 0 || output.empty())
+    {
+        return false;
+    }
+
+    Art art;
+    string line;
+    for (size_t i = 0; i < output.size(); ++i)
+    {
+        if (output[i] == '\n')
+        {
+            art.width = max(art.width, displayWidth(line));
+            art.lines.push_back(line);
+            line.clear();
+        }
+        else if (output[i] != '\r')
+        {
+            line += output[i];
+        }
+    }
+    if (!line.empty())
+    {
+        art.width = max(art.width, displayWidth(line));
+        art.lines.push_back(line);
+    }
+    // chafa pads its canvas with blank rows/columns to fill the requested
+    // box exactly; trim the blank rows so the header's height reflects the
+    // glyphs actually drawn, not chafa's fixed output grid.
+    while (!art.lines.empty() && art.lines.back().find_first_not_of(' ') == string::npos)
+    {
+        art.lines.pop_back();
+    }
+    while (!art.lines.empty() && art.lines.front().find_first_not_of(' ') == string::npos)
+    {
+        art.lines.erase(art.lines.begin());
+    }
+
+    if (art.lines.empty())
+    {
+        return false;
+    }
+    const int neededRows = static_cast<int>(art.lines.size()) + minScrollRows;
+    if (art.width > termWidth || neededRows > termHeight)
+    {
+        return false;
+    }
+
+    out = art;
+    return true;
+}
+
 }  // namespace
 
 namespace layout
@@ -121,38 +218,63 @@ namespace layout
 
 void printSplash(int termWidth, int termHeight)
 {
-    Art art;
-    string chosenName;
-    // Reserve 2 rows: a blank line plus a "press any key" hint printed by the
-    // caller once the art is up.
-    if (!pickFittingTier(splashTierNames(), termWidth, termHeight, 2, art, chosenName))
+    // No skip hint is ever printed on this (non-interactive) path, so there
+    // is nothing to reserve room for.
+    const SplashBlock block = composeSplash(termWidth, termHeight, 0);
+    for (size_t i = 0; i < block.lines.size(); ++i)
     {
-        return;  // no splash asset could be read at all; not fatal, just skip it
+        cout << block.lines[i] << "\r\n";
     }
-    printCentered(art, termWidth);
 }
 
-string pickSplashAssetPath(int termWidth, int termHeight)
+SplashBlock composeSplash(int termWidth, int termHeight, int reservedTopRows)
 {
+    SplashBlock block;
+    block.artStartIndex = 0;
+
     Art art;
     string chosenName;
-    if (!pickFittingTier(splashTierNames(), termWidth, termHeight, 2, art, chosenName))
+    if (!pickFittingTier(splashTierNames(), termWidth, termHeight, reservedTopRows, art, chosenName))
     {
-        return "";
+        return block;  // no splash asset could be read at all; not fatal, just nothing to show
     }
-    return paths::asset(chosenName);
+
+    const int availableRows = max(0, termHeight - reservedTopRows);
+    const int topPad = max(0, (availableRows - static_cast<int>(art.lines.size())) / 2);
+    for (int i = 0; i < topPad; ++i)
+    {
+        block.lines.push_back("");
+    }
+    block.artStartIndex = static_cast<int>(block.lines.size());
+
+    const int pad = max(0, (termWidth - art.width) / 2);
+    const string padding(pad, ' ');
+    for (size_t i = 0; i < art.lines.size(); ++i)
+    {
+        block.lines.push_back(padding + art.lines[i]);
+    }
+    return block;
 }
 
 int drawHeader(int termWidth, int termHeight, int minScrollRows)
 {
-    vector<string> tiers;
-    tiers.push_back("header-wide.txt");
-    tiers.push_back("header-compact.txt");
-    tiers.push_back("header-plain.txt");
-
     Art art;
-    string chosenName;
-    if (!pickFittingTier(tiers, termWidth, termHeight, minScrollRows, art, chosenName))
+    bool haveArt = tryChafaHeader(termWidth, termHeight, minScrollRows, art);
+
+    if (!haveArt)
+    {
+        // header-wide.txt (a plain-ASCII figlet substitute for the original
+        // block-glyph art) is deliberately not in this list any more --
+        // chafa now serves the role that tier played. These two remain as
+        // the fallback when chafa isn't installed or nothing fits.
+        vector<string> tiers;
+        tiers.push_back("header-compact.txt");
+        tiers.push_back("header-plain.txt");
+        string chosenName;
+        haveArt = pickFittingTier(tiers, termWidth, termHeight, minScrollRows, art, chosenName);
+    }
+
+    if (!haveArt)
     {
         return 0;  // nothing to draw; leave the scroll region untouched
     }
